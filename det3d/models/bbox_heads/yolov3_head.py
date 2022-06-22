@@ -1,25 +1,22 @@
 import torch
 import logging
 import torch.nn as nn
-import numpy as np
-import torch.nn.functional as F
 import cv2
-import math
-import time
-import datetime
 
+import torch.nn.functional as F
 import torchvision.ops
 
 from det3d.torchie.cnn import xavier_init, kaiming_init
 from det3d.core import box_torch_ops, box_np_ops
+from det3d.core import xywh2xyxy
 from ..registry import HEADS
-from det3d.models.losses.yolo_loss import BBoxRegLoss, CIoULoss, GridRegLoss, CrossEntropyLoss, FocalLoss
+from det3d.models.losses.yolo_loss import IoULoss, GridRegLoss, BBoxRegLoss, FocalLoss, CrossEntropyLoss
 from ..utils import build_norm_layer
 
 
 def hard_negative_mining(neg_mask, pos_mask, pred_cls, num_samples, neg_ratio=5.):
     neg_score = torch.where(neg_mask.type(torch.bool), nn.Softmax(dim=-1)(pred_cls)[:, 0],
-                            1 - neg_mask)  # take false positives
+                            1.0 - neg_mask)  # take false positives
 
     # Number of negative entries to select.
     pos_num = torch.sum(pos_mask)
@@ -38,24 +35,6 @@ def hard_negative_mining(neg_mask, pos_mask, pred_cls, num_samples, neg_ratio=5.
     return hard_neg_mask, max_value
 
 
-class h_sigmoid(nn.Module):
-    def __init__(self):
-        super(h_sigmoid, self).__init__()
-        self.relu = nn.ReLU6()
-
-    def forward(self, x):
-        return self.relu(x + 3) / 6
-
-
-class h_swish(nn.Module):
-    def __init__(self):
-        super(h_swish, self).__init__()
-        self.sigmoid = h_sigmoid()
-
-    def forward(self, x):
-        return x * self.sigmoid(x)
-
-
 class SELayer(nn.Module):
     def __init__(self, channel, reduction=8):
         super(SELayer, self).__init__()
@@ -64,7 +43,7 @@ class SELayer(nn.Module):
             nn.Linear(channel, channel // reduction),
             nn.ReLU(),
             nn.Linear(channel // reduction, channel),
-            h_sigmoid()
+            nn.Sigmoid()
         )
 
     def forward(self, x):
@@ -101,7 +80,7 @@ def conv2d(inp, oup, kernel, stride, bias=False):
     return nn.Sequential(
         nn.Conv2d(inp, oup, kernel, stride, pad, bias=bias),
         batch_norm(oup),
-        h_swish(),
+        nn.Mish(),
     )
 
 
@@ -118,12 +97,7 @@ class YOLOv3Head(nn.Module):
     """Detection layer"""
 
     def __init__(self, anchors,
-                 tasks,
                  img_dim,
-                 alpha,
-                 gamma,
-                 exp_alpha,
-                 num_classes,
                  first_map_conv_channels,
                  second_map_conv_channels,
                  third_map_conv_channels,
@@ -133,15 +107,14 @@ class YOLOv3Head(nn.Module):
                  attention_channels,
                  logger=None):
         super(YOLOv3Head, self).__init__()
-        self.class_names = [t["class_names"] for t in tasks]
+
+        self.class_names = ["pedestrian"]
         self.anchors = anchors
         self.num_anchors = len(anchors) // 3
-        self.num_classes = num_classes
         self.sigma_class = nn.Parameter(torch.tensor([0.0]))
         self.sigma_loc = nn.Parameter(torch.tensor([0.0]))
         self.sigma_grid = nn.Parameter(torch.tensor([0.0]))
         self.num_predictions = first_map_conv_channels[-1] // self.num_anchors
-        self.exp_alpha = exp_alpha
         self.img_dim = img_dim
 
         self.class_loss = CrossEntropyLoss(reduction='mean')
@@ -173,8 +146,7 @@ class YOLOv3Head(nn.Module):
             else:
                 self.second_map_conv2d.append(
                     conv2d(second_map_conv_channels[i - 1], second_map_conv_channels[i], 3, 1, bias=False))
-        self.second_map_conv2d.append(
-            nn.Conv2d(second_map_conv_channels[-2], second_map_conv_channels[-1], 1, bias=True))
+        self.second_map_conv2d.append(nn.Conv2d(second_map_conv_channels[-2], second_map_conv_channels[-1], 1, bias=True))
 
         # third map 2D convolution layers
         self.third_map_conv2d = nn.ModuleList()
@@ -234,10 +206,6 @@ class YOLOv3Head(nn.Module):
             logger = logging.getLogger("YOLOv3Head")
         self.logger = logger
 
-        logger.info(
-            f"num_classes: {num_classes}"
-        )
-
         self._initialize_weights()
 
         logger.info("Finish YOLOV3Head Initialization")
@@ -261,8 +229,8 @@ class YOLOv3Head(nn.Module):
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
                 # kaiming_init(m, nonlinearity='relu')  # TODO weight initialization could be changed
-                # xavier_init(m, distribution="uniform")
-                m.weight.data.normal_(0, 0.02)
+                xavier_init(m, distribution="normal")
+                # m.weight.data.normal_(0, 0.02)
                 if m.bias is not None:
                     m.bias.data.zero_()
             elif isinstance(m, nn.BatchNorm2d):
@@ -289,7 +257,6 @@ class YOLOv3Head(nn.Module):
                                                                           weighted_third_feature.shape[3])
 
         # spatial attention module
-        exp_grid = torch.exp(self.exp_alpha * grid_map3)
         repeated_grid = grid_map3.unsqueeze(1).repeat(1, weighted_third_feature.shape[1], 1, 1)
         third_pred = torch.mul(weighted_third_feature, repeated_grid)
         for i, layer in enumerate(self.third_map_conv2d):
@@ -309,7 +276,6 @@ class YOLOv3Head(nn.Module):
                                                                            weighted_second_feature.shape[3])
 
         # spatial attention module
-        exp_grid = torch.exp(self.exp_alpha * grid_map2)
         repeated_grid = grid_map2.unsqueeze(1).repeat(1, weighted_second_feature.shape[1], 1, 1)
         second_pred = torch.mul(weighted_second_feature, repeated_grid)
         for i, layer in enumerate(self.second_map_conv2d):
@@ -329,7 +295,6 @@ class YOLOv3Head(nn.Module):
                                                                           weighted_first_feature.shape[3])
 
         # spatial attention module
-        exp_grid = torch.exp(self.exp_alpha * grid_map1)
         repeated_grid = grid_map1.unsqueeze(1).repeat(1, weighted_first_feature.shape[1], 1, 1)
         first_pred = torch.mul(weighted_first_feature, repeated_grid)
         for i, layer in enumerate(self.first_map_conv2d):
@@ -402,17 +367,14 @@ class YOLOv3Head(nn.Module):
         """
         # first yolo map ground truths
         tboxes1 = example['yolo_map1'][..., :-1]
-        # tboxes1 = example['target_boxes_grid1']
         tcls1 = example['yolo_map1'][..., -1].view(-1).long()
 
         # second yolo map ground truths
         tboxes2 = example['yolo_map2'][..., :-1]
-        # tboxes2 = example['target_boxes_grid2']
         tcls2 = example['yolo_map2'][..., -1].view(-1).long()
 
         # third yolo map ground truths
         tboxes3 = example['yolo_map3'][..., :-1]
-        # tboxes3 = example['target_boxes_grid3']
         tcls3 = example['yolo_map3'][..., -1].view(-1).long()
 
         # grid classifiers ground truth
@@ -494,9 +456,9 @@ class YOLOv3Head(nn.Module):
         grid_loss = 0.5 * (torch.exp(-self.sigma_grid) * sum_grid_loss + self.sigma_grid)
 
         # classification loss
-        cls_loss1 = self.class_loss(pred_cls1, tcls1, pos_mask1, hard_neg_mask1, batch_size)
-        cls_loss2 = self.class_loss(pred_cls2, tcls2, pos_mask2, hard_neg_mask2, batch_size)
-        cls_loss3 = self.class_loss(pred_cls3, tcls3, pos_mask3, hard_neg_mask3, batch_size)
+        cls_loss1 = self.class_loss(pred_cls1, tcls1, pos_mask1, hard_neg_mask1)
+        cls_loss2 = self.class_loss(pred_cls2, tcls2, pos_mask2, hard_neg_mask2)
+        cls_loss3 = self.class_loss(pred_cls3, tcls3, pos_mask3, hard_neg_mask3)
         sum_cls_loss = cls_loss1 + cls_loss2 + cls_loss3
         cls_loss = 1.0 * (torch.exp(-self.sigma_class) * sum_cls_loss + self.sigma_class)
 
@@ -505,7 +467,7 @@ class YOLOv3Head(nn.Module):
 
         ret = {}
         ret.update({'loss': loss, 'cls_loss': sum_cls_loss, 'loc_loss': sum_loc_loss, 'grid_loss': sum_grid_loss,
-                    'sigma_loc': self.sigma_loc, 'sigma_grid': self.sigma_grid, 'sigma_class': self.sigma_class,
+                    'sigma_class': self.sigma_class, 'sigma_loc': self.sigma_loc, 'sigma_grid': self.sigma_grid,
                     'num_pedestrians': pos_num, 'max_hard_value': max_value1})
 
         return ret
@@ -549,9 +511,10 @@ class YOLOv3Head(nn.Module):
         # pred_map1_vis = cv2.resize(pred_map1_vis, (self.img_dim, self.img_dim))
         # pred_map2_vis = cv2.resize(pred_map2_vis, (self.img_dim, self.img_dim))
         # pred_map3_vis = cv2.resize(pred_map3_vis, (self.img_dim, self.img_dim))
-        # cv2.imwrite("predicted_grid_map1.png", pred_map1_vis * 255)
-        # cv2.imwrite("predicted_grid_map2.png", pred_map2_vis * 255)
-        # cv2.imwrite("predicted_grid_map3.png", pred_map3_vis * 255)
+        # cv2.imshow("predicted_grid_map1", pred_map1_vis)
+        # cv2.imshow("predicted_grid_map2", pred_map2_vis)
+        # cv2.imshow("predicted_grid_map3", pred_map3_vis)
+        # cv2.waitKey(0)
 
         if "metadata" not in example or len(example["metadata"]) == 0:
             meta_list = [None] * batch_size
@@ -620,31 +583,14 @@ class YOLOv3Head(nn.Module):
             ),
             -1,
         )
-        output = torch.cat((output1, output2, output3), dim=1)
 
-        rets = []
-        if test_cfg.get('per_class_nms', False):
-            pass
-        else:
-            rets = self.post_processing(output, grid_maps, test_cfg)
+        outputs = torch.cat((output1, output2, output3), dim=1)
+        rets = self.post_processing(outputs, test_cfg)
 
-        # Merge batches results
-        ret_list = []
-        for i in range(batch_size):
-            ret = {}
-            if rets[i] is not None:
-                ret = rets[i]
-                ret['metadata'] = meta_list[i]
-            else:
-                ret['boxes'] = None
-                ret['scores'] = None
-                ret['metadata'] = meta_list[i]
-            ret_list.append(ret)
-
-        return ret_list
+        return rets
 
     @torch.no_grad()
-    def post_processing(self, predictions, grid_maps, test_cfg):
+    def post_processing(self, prediction, test_cfg):
         """
             Removes detections with lower object confidence score than 'conf_thres' and performs
             Non-Maximum Suppression to further filter detections.
@@ -652,31 +598,37 @@ class YOLOv3Head(nn.Module):
         """
         conf_thres = test_cfg.conf_thres
         nms_thres = test_cfg.nms_thres
+        max_det = test_cfg.max_det
+        max_nms = test_cfg.max_nms
 
-        # From (center x, center y, width, height) to (x1, y1, x2, y2)
-        predictions[..., :4] = box_np_ops.xywh2xyxy(predictions[..., :4])
+        output = [torch.zeros((0, 5), device="cpu")] * prediction.shape[0]
+        for xi, x in enumerate(prediction):  # image index, image inference
+            # Apply constraints
+            x = x[x[..., -1] > conf_thres]  # confidence
 
-        prediction_dicts = [None for _ in range(len(predictions))]
-        for image_i, (image_pred, grid_map) in enumerate(zip(predictions, grid_maps)):
-            yolo_scores = image_pred[..., -1].view(-1)
-            yolo_boxes = image_pred[..., :4].view(-1, 4)
-
-            # Filter out confidence scores below threshold
-            mask = yolo_scores > conf_thres
-            scores = yolo_scores[mask]
-            bboxes = yolo_boxes[mask]
-
-            # If none are remaining => process next image
-            if not bboxes.size(0):
+            # If none remain process next image
+            if not x.shape[0]:
                 continue
 
-            # Perform non-maximum suppression
-            keep_idx = torchvision.ops.nms(bboxes, scores, nms_thres)
-            if keep_idx is not None:
-                prediction_dict = {
-                    'boxes': bboxes[keep_idx].view(-1, 4),
-                    'scores': scores[keep_idx]
-                }
-                prediction_dicts[image_i] = prediction_dict
+            # Box (center x, center y, width, height) to (x1, y1, x2, y2)
+            box = box_np_ops.xywh2xyxy(x[:, :4])
+            conf = x[:, -1]
+            x = torch.cat((box, conf[:, None]), 1)
 
-        return prediction_dicts
+            # Check shape
+            n = x.shape[0]  # number of boxes
+            if not n:  # no boxes
+                continue
+            elif n > max_nms:  # excess boxes
+                # sort by confidence
+                x = x[x[:, 4].argsort(descending=True)[:max_nms]]
+
+            # Batched NMS
+            boxes, scores = x[:, :4], x[:, 4]
+            i = torchvision.ops.nms(boxes, scores, nms_thres)  # NMS
+            if i.shape[0] > max_det:  # limit detections
+                i = i[:max_det]
+
+            output[xi] = x[i].detach().cpu()
+
+        return output

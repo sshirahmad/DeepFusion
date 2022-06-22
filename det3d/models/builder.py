@@ -46,5 +46,5 @@ def build_loss(cfg):
     return build(cfg, LOSSES)
 
 
-def build_detector(cfg, train_cfg=None, test_cfg=None):
-    return build(cfg, DETECTORS, dict(train_cfg=train_cfg, test_cfg=test_cfg))
+def build_detector(cfg, test_cfg=None):
+    return build(cfg, DETECTORS, dict(test_cfg=test_cfg))

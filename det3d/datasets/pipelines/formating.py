@@ -88,11 +88,7 @@ class Reformat(object):
                 metadata=meta,
                 image=image,
             )
-            if res["mode"] == "train":
-                data_bundle.update(res["camera"]["targets"])
-            elif res["mode"] == "val":
-                data_bundle.update(dict(metadata=meta,))
-
+            data_bundle.update(res["camera"]["targets"])
         else:
             raise NotImplementedError
 

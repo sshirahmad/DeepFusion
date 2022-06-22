@@ -49,7 +49,6 @@ class OptimizerHook(Hook):
 
     def after_train_iter(self, trainer):
         trainer.optimizer.zero_grad()
-        # print(trainer.outputs["loss"])
         trainer.outputs["loss"].backward()
         if self.grad_clip is not None:
             self.clip_grads(trainer.model.parameters())

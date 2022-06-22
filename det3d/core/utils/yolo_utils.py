@@ -2,8 +2,11 @@ from __future__ import division
 import math
 import time
 import tqdm
+import cv2
 import torch
 import numpy as np
+from det3d.core.bbox.box_np_ops import overlap_jit
+
 
 
 def to_cpu(tensor):
@@ -104,7 +107,7 @@ def log_average_miss_rate(prec, rec):
     return lamr, mr, fppi
 
 
-def compute_ap(tp, pred_scores, target_cls, miss):
+def compute_ap(tp, pred_scores, labels):
     """ Compute the average precision, given the recall and precision curves.
     Source: https://github.com/rafaelpadilla/Object-Detection-Metrics.
     # Arguments
@@ -116,9 +119,12 @@ def compute_ap(tp, pred_scores, target_cls, miss):
         The average precision as computed in py-faster-rcnn.
     """
 
+    # Sort by objectness
+    i = np.argsort(-pred_scores)
+    tp, conf = tp[i], pred_scores[i]
     # Create Precision-Recall curve and compute AP for each class
-    n_gt = len(target_cls) + miss  # Number of ground truth objects
-    n_p = len(pred_scores)  # Number of predicted objects
+    n_gt = len(labels)  # Number of ground truth objects
+    n_p = len(tp)  # Number of predicted objects
 
     if n_p == 0 or n_gt == 0:
         ap = 0
@@ -162,41 +168,52 @@ def compute_ap(tp, pred_scores, target_cls, miss):
     return precision_curve, recall_curve, p, r, ap, f1
 
 
-def match_boxes(outputs, target_boxes, iou_threshold):
+def get_batch_statistics(outputs, targets, iou_threshold):
     """ Compute true positives, predicted scores and predicted labels per sample """
-    metrics = []
+    batch_metrics = []
+    batch_matched_inds = []
+    for sample_i in range(len(outputs)):
 
-    pred_boxes = outputs["boxes"]
-    pred_scores = outputs["scores"]
+        if outputs[sample_i] is None:
+            continue
 
-    true_positives = np.zeros(pred_boxes.shape[0])
-    detected_boxes = []
-    matched_boxes = []
-    matched_scores = []
+        output = outputs[sample_i]
+        pred_boxes = output[:, :4]
+        pred_scores = output[:, 4]
 
-    for pred_i, (pred_box, pred_score) in enumerate(zip(pred_boxes, pred_scores)):
+        true_positives = np.zeros(pred_boxes.shape[0])
+        annotations = targets[targets[:, 0] == sample_i][:, 1:]
+        detected_boxes = []
+        matched_pred_boxes = []
+        if len(annotations):
+            target_boxes = annotations
 
-        # If targets are found break
-        if len(detected_boxes) == len(target_boxes):
-            break
+            for pred_i, pred_box in enumerate(pred_boxes):
 
-        iou, box_index = bbox_iou(pred_box.unsqueeze(0), target_boxes).max(0)
-        if iou >= iou_threshold and box_index not in detected_boxes:
-                true_positives[pred_i] = 1
-                detected_boxes += [box_index]
-                matched_boxes += [pred_box.unsqueeze(0)]
-                matched_scores += [pred_score.unsqueeze(0)]
+                # If targets are found break
+                if len(detected_boxes) == len(annotations):
+                    break
 
-    metrics.append([true_positives, pred_scores])
-    return metrics, matched_boxes, matched_scores
+                # Find the best matching target for our predicted box
+                iou, box_index = bbox_iou(pred_box.unsqueeze(0), target_boxes).max(0)
+
+                # Check if the iou is above the min threshold and i
+                if iou >= iou_threshold and box_index not in detected_boxes:
+                    true_positives[pred_i] = 1
+                    detected_boxes += [box_index]
+                    matched_pred_boxes += [pred_i]
+
+        batch_metrics.append([true_positives, pred_scores])
+        batch_matched_inds.append(matched_pred_boxes)
+
+    return batch_metrics, batch_matched_inds
 
 
 def bbox_wh_iou(wh1, wh2):
-    wh2 = wh2.t()
-    w1, h1 = wh1[0], wh1[1]
-    w2, h2 = wh2[0], wh2[1]
-    inter_area = torch.min(w1, w2) * torch.min(h1, h2)
-    union_area = (w1 * h1 + 1e-16) + w2 * h2 - inter_area
+    w1, h1 = wh1[2] - wh1[0], wh1[3] - wh1[1]
+    w2, h2 = wh2[:, 0], wh2[:, 1]
+    inter_area = np.minimum(w1, w2) * np.minimum(h1, h2)
+    union_area = w1 * h1 + w2 * h2 - inter_area
     return inter_area / union_area
 
 
@@ -274,57 +291,239 @@ def non_max_suppression(prediction, conf_thres=0.5, nms_thres=0.4):
     return output
 
 
-def build_targets(pred_boxes, pred_cls, target, anchors, ignore_thres):
-    BoolTensor = torch.cuda.BoolTensor if pred_boxes.is_cuda else torch.BoolTensor
-    FloatTensor = torch.cuda.FloatTensor if pred_boxes.is_cuda else torch.FloatTensor
+def build_targets(gt_boxes, img_size, anchors, surrounding_size, top_k, obj_thres):
+    corner_bboxes = xywh2xyxy_np(gt_boxes[:, 1:])
 
-    nB = pred_boxes.size(0)
-    nA = pred_boxes.size(1)
-    nC = pred_cls.size(-1)
-    nG = pred_boxes.size(2)
+    nA = len(anchors)
+    nG = list([img_size // 8, img_size // 16, img_size // 32])
+    valid_anchors = list(np.array([[0, 1, 2], [3, 4, 5], [6, 7, 8]]))
+    best_anchor_ind = [np.argmax(bbox_wh_iou(gt_box, anchors)) for gt_box in corner_bboxes]
 
     # Output tensors
-    obj_mask = BoolTensor(nB, nA, nG, nG).fill_(0)
-    noobj_mask = BoolTensor(nB, nA, nG, nG).fill_(1)
-    class_mask = FloatTensor(nB, nA, nG, nG).fill_(0)
-    iou_scores = FloatTensor(nB, nA, nG, nG).fill_(0)
-    tx = FloatTensor(nB, nA, nG, nG).fill_(0)
-    ty = FloatTensor(nB, nA, nG, nG).fill_(0)
-    tw = FloatTensor(nB, nA, nG, nG).fill_(0)
-    th = FloatTensor(nB, nA, nG, nG).fill_(0)
-    tcls = FloatTensor(nB, nA, nG, nG, nC).fill_(0)
+    classifier_maps = []
+    yolo_maps = []
+    obj_masks = []
+    noobj_masks = []
+    for k, size in enumerate(nG):
+        # make target boxes relative to grid map
+        target_boxes = corner_bboxes
 
-    # Convert normalized bounding boxes to grid cell size
-    target_boxes = target[:, 2:6] * nG
-    gxy = target_boxes[:, :2]
-    gwh = target_boxes[:, 2:]
-    # Get anchors with best iou
-    ious = torch.stack([bbox_wh_iou(anchor, gwh) for anchor in anchors])
-    best_ious, best_n = ious.max(0)
-    # Separate target values
-    b, target_labels = target[:, :2].long().t()
-    gx, gy = gxy.t()
-    gw, gh = gwh.t()
-    gi, gj = gxy.long().t()
-    # Set masks
-    obj_mask[b, best_n, gj, gi] = 1
-    noobj_mask[b, best_n, gj, gi] = 0
+        obj_mask = np.zeros(shape=(nA // 3, size, size), dtype=np.bool_)
+        noobj_mask = np.ones(shape=(nA // 3, size, size), dtype=np.bool_)
+        tx = np.zeros(shape=(nA // 3, size, size), dtype=np.float32)
+        ty = np.zeros(shape=(nA // 3, size, size), dtype=np.float32)
+        tw = np.zeros(shape=(nA // 3, size, size), dtype=np.float32)
+        th = np.zeros(shape=(nA // 3, size, size), dtype=np.float32)
+        grid_maps = np.zeros(shape=(size, size), dtype=np.float32)
 
-    # Set noobj mask to zero where iou exceeds ignore threshold
-    for i, anchor_ious in enumerate(ious.t()):
-        noobj_mask[b[i], anchor_ious > ignore_thres, gj[i], gi[i]] = 0
+        # create groundtruth of YOLO classifiers
+        h_per_cell = 1 / size
+        w_per_cell = 1 / size
+        center_location_h_index = np.int32((target_boxes[:, 1] + target_boxes[:, 3]) / (2 * h_per_cell))
+        center_location_w_index = np.int32((target_boxes[:, 0] + target_boxes[:, 2]) / (2 * w_per_cell))
 
-    # Coordinates
-    tx[b, best_n, gj, gi] = gx - gx.floor()
-    ty[b, best_n, gj, gi] = gy - gy.floor()
-    # Width and height
-    tw[b, best_n, gj, gi] = torch.log(gw / anchors[best_n][:, 0] + 1e-16)
-    th[b, best_n, gj, gi] = torch.log(gh / anchors[best_n][:, 1] + 1e-16)
-    # One-hot encoding of label
-    tcls[b, best_n, gj, gi, target_labels] = 1
-    # Compute label correctness and iou at best anchor
-    class_mask[b, best_n, gj, gi] = (pred_cls[b, best_n, gj, gi].argmax(-1) == target_labels).float()
-    iou_scores[b, best_n, gj, gi] = bbox_iou(pred_boxes[b, best_n, gj, gi], target_boxes, x1y1x2y2=False)
+        scaled_anchors = anchors[valid_anchors[k]] / img_size
 
-    tconf = obj_mask.float()
-    return iou_scores, class_mask, obj_mask, noobj_mask, tx, ty, tw, th, tcls, tconf
+        # find the index of surrounding priori boxes
+        total_ovr_info = []
+        priori_box_index = []
+        for iter in range(len(center_location_w_index)):
+            if center_location_h_index[iter] - surrounding_size >= 0:
+                min_h_index = center_location_h_index[iter] - surrounding_size
+            else:
+                min_h_index = 0
+            if center_location_h_index[iter] + surrounding_size <= size - 1:
+                max_h_index = center_location_h_index[iter] + surrounding_size
+            else:
+                max_h_index = size - 1
+            if center_location_w_index[iter] - surrounding_size >= 0:
+                min_w_index = center_location_w_index[iter] - surrounding_size
+            else:
+                min_w_index = 0
+            if center_location_w_index[iter] + surrounding_size <= size - 1:
+                max_w_index = center_location_w_index[iter] + surrounding_size
+            else:
+                max_w_index = size - 1
+
+            h_indexes = np.arange(min_h_index, max_h_index + 1, 1)
+            w_indexes = np.arange(min_w_index, max_w_index + 1, 1)
+
+            # compute the IOU of each bounding box with its surrounding priori boxes
+            ovr_info = []
+            for wIndex in w_indexes:
+                for hIndex in h_indexes:
+                    # calculate center and dimensions of surrounding anchor boxes
+                    y_c = (hIndex + 0.5) * h_per_cell
+                    x_c = (wIndex + 0.5) * w_per_cell
+                    h_p = scaled_anchors[:, 1]
+                    w_p = scaled_anchors[:, 0]
+
+                    # calculate IoU of surrounding anchor boxes and groundtruths
+                    for i in range(len(scaled_anchors)):
+                        x_min = x_c - w_p[i] / 2
+                        x_max = x_c + w_p[i] / 2
+                        y_min = y_c - h_p[i] / 2
+                        y_max = y_c + h_p[i] / 2
+
+                        areaP = (x_max - x_min) * (y_max - y_min)
+                        areaG = (target_boxes[iter, 2] - target_boxes[iter, 0]) * (
+                                target_boxes[iter, 3] - target_boxes[iter, 1])
+                        xx1 = np.maximum(x_min, target_boxes[iter, 0])
+                        yy1 = np.maximum(y_min, target_boxes[iter, 1])
+                        xx2 = np.minimum(x_max, target_boxes[iter, 2])
+                        yy2 = np.minimum(y_max, target_boxes[iter, 3])
+                        w = np.maximum(0.0, xx2 - xx1)
+                        h = np.maximum(0.0, yy2 - yy1)
+                        inter = w * h
+                        ovr = inter / (areaP + areaG - inter)
+
+                        ovr_info.append([hIndex, wIndex, i, ovr])
+
+            ovr_info = np.array(ovr_info)
+            ovr_info = ovr_info.reshape(-1, 4)
+            total_ovr_info.append(ovr_info)
+
+            try:
+                inds = np.argsort(ovr_info[:, 3])[::-1]
+            except IndexError:
+                pass
+
+            num = 0
+            for index in inds:
+                info = [ovr_info[index][0], ovr_info[index][1], ovr_info[index][2]]
+                if info not in priori_box_index:  # to avoid same priorBox match multi groundTruth
+                    if num >= top_k:  # this value means we choose the top-k ovr box to be the positive box
+                        break
+                    priori_box_index.append([ovr_info[index][0], ovr_info[index][1], ovr_info[index][2]])
+                    num += 1
+
+        priori_box_index = np.array(priori_box_index, dtype=np.int32)
+        priori_box_index = priori_box_index.reshape([-1, top_k, 3])
+        mask_grid = np.zeros(len(target_boxes), dtype=np.bool_)
+        for ground_truth_index in range(len(total_ovr_info)):
+            target_bbox = target_boxes[ground_truth_index]
+            if best_anchor_ind[ground_truth_index] in valid_anchors[k]:
+                mask_grid[ground_truth_index] = 1
+                for index_info in priori_box_index[ground_truth_index]:
+                    anchor_ind = int(index_info[2])
+                    y_ind = int(index_info[0])
+                    x_ind = int(index_info[1])
+
+                    y_c_anchor = (index_info[0] + 0.5) * h_per_cell
+                    x_c_anchor = (index_info[1] + 0.5) * w_per_cell
+                    h_anchor = scaled_anchors[anchor_ind, 1]
+                    w_anchor = scaled_anchors[anchor_ind, 0]
+
+                    y_c_gt = (target_bbox[3] + target_bbox[1]) / 2
+                    x_c_gt = (target_bbox[0] + target_bbox[2]) / 2
+                    h_gt = target_bbox[3] - target_bbox[1]
+                    w_gt = target_bbox[2] - target_bbox[0]
+
+                    # difference between anchor boxes and groundtruth
+                    y_t = (y_c_gt - y_c_anchor) / h_anchor
+                    x_t = (x_c_gt - x_c_anchor) / w_anchor
+                    h_t = np.log(h_gt / h_anchor + 1e-16)
+                    w_t = np.log(w_gt / w_anchor + 1e-16)
+
+                    tx[anchor_ind, y_ind, x_ind] = x_t
+                    ty[anchor_ind, y_ind, x_ind] = y_t
+                    tw[anchor_ind, y_ind, x_ind] = w_t
+                    th[anchor_ind, y_ind, x_ind] = h_t
+
+                    obj_mask[anchor_ind, y_ind, x_ind] = 1
+                    noobj_mask[anchor_ind, y_ind, x_ind] = 0
+
+            for index_info in total_ovr_info[ground_truth_index]:
+                if index_info[-1] >= obj_thres:
+                    mask_grid[ground_truth_index] = 1
+                    anchor_ind = int(index_info[2])
+                    y_ind = int(index_info[0])
+                    x_ind = int(index_info[1])
+
+                    y_c_anchor = (index_info[0] + 0.5) * h_per_cell
+                    x_c_anchor = (index_info[1] + 0.5) * w_per_cell
+                    h_anchor = scaled_anchors[anchor_ind, 1]
+                    w_anchor = scaled_anchors[anchor_ind, 0]
+
+                    y_c_gt = (target_bbox[3] + target_bbox[1]) / 2
+                    x_c_gt = (target_bbox[0] + target_bbox[2]) / 2
+                    h_gt = target_bbox[3] - target_bbox[1]
+                    w_gt = target_bbox[2] - target_bbox[0]
+
+                    # difference between anchor boxes and groundtruth
+                    y_t = (y_c_gt - y_c_anchor) / h_anchor
+                    x_t = (x_c_gt - x_c_anchor) / w_anchor
+                    h_t = np.log(h_gt / h_anchor + 1e-16)
+                    w_t = np.log(w_gt / w_anchor + 1e-16)
+
+                    tx[anchor_ind, y_ind, x_ind] = x_t
+                    ty[anchor_ind, y_ind, x_ind] = y_t
+                    tw[anchor_ind, y_ind, x_ind] = w_t
+                    th[anchor_ind, y_ind, x_ind] = h_t
+
+                    obj_mask[anchor_ind, y_ind, x_ind] = 1
+                    noobj_mask[anchor_ind, y_ind, x_ind] = 0
+
+        # create groundtruth of grid classifiers
+        x = np.arange(size, dtype=np.float32)
+        y = x.T
+        if mask_grid.any():
+            for i in range(size):
+                for j in range(size):
+                    box = np.array([[x[i], y[j], x[i] + 1, y[j] + 1]])
+                    iou = overlap_jit(target_boxes[mask_grid] * size, box)
+                    grid_maps[j, i] = iou.max(0)
+
+        tcls = obj_mask.astype(np.float)
+        gt_boxes_cls = np.stack((tx, ty, tw, th, tcls), axis=-1)
+        classifier_maps.append(grid_maps)
+        yolo_maps.append(gt_boxes_cls)
+        obj_masks.append(obj_mask)
+        noobj_masks.append(noobj_mask)
+
+    example = {}
+    example.update({
+        'yolo_map1': yolo_maps[0],
+        'yolo_map2': yolo_maps[1],
+        'yolo_map3': yolo_maps[2],
+        'classifier_map1': classifier_maps[0],
+        'classifier_map2': classifier_maps[1],
+        'classifier_map3': classifier_maps[2],
+        'obj_mask1': obj_masks[0],
+        'noobj_mask1': noobj_masks[0],
+        'obj_mask2': obj_masks[1],
+        'noobj_mask2': noobj_masks[1],
+        'obj_mask3': obj_masks[2],
+        'noobj_mask3': noobj_masks[2],
+    })
+
+    return example
+
+
+def build_grid_targets(gt_boxes, img_size):
+    corner_bboxes = xywh2xyxy_np(gt_boxes[:, 1:])
+
+    nG = list([img_size // 8, img_size // 16, img_size // 32])
+    classifier_maps = []
+    for size in nG:
+        grid_maps = np.zeros(shape=(size, size), dtype=np.float32)
+        # create groundtruth of grid classifiers
+        x = np.arange(size, dtype=np.float32)
+        y = x.T
+        for i in range(size):
+            for j in range(size):
+                box = np.array([[x[i], y[j], x[i] + 1, y[j] + 1]])
+                iou = overlap_jit(corner_bboxes * size, box)
+                grid_maps[j, i] = iou.max(0)
+
+        classifier_maps.append(grid_maps)
+
+    example = {}
+    example.update({
+        'classifier_map1': classifier_maps[0],
+        'classifier_map2': classifier_maps[1],
+        'classifier_map3': classifier_maps[2],
+    })
+
+    return example
+

@@ -13,13 +13,12 @@ class DeepFusion(SingleStageDetector):
         backbone_image=None,
         backbone_radar=None,
         reader=None,
-        train_cfg=None,
         test_cfg=None,
         pretrained=None,
     ):
         super(DeepFusion, self).__init__(
             backbone_image=backbone_image, backbone_radar=backbone_radar, reader=reader, bbox_head=bbox_head,
-            train_cfg=train_cfg, test_cfg=test_cfg, pretrained=pretrained
+            test_cfg=test_cfg, pretrained=pretrained
         )
 
     def extract_feat(self, data, **kwargs):

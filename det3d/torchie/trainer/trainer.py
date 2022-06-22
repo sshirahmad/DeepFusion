@@ -1,14 +1,12 @@
 import logging
 import os.path as osp
-import queue
-import sys
-import threading
-import time
-from collections import OrderedDict
 
-import matplotlib.pyplot as plt
+from collections import OrderedDict
 import torch
 from det3d import torchie
+from torch.autograd import Variable
+import numpy as np
+
 
 from . import hooks
 from .checkpoint import load_checkpoint, save_checkpoint
@@ -20,6 +18,8 @@ from .hooks import (
     OptimizerHook,
     lr_updater,
 )
+from det3d.core.utils.yolo_utils import get_batch_statistics, xywh2xyxy, compute_ap
+
 from .log_buffer import LogBuffer
 from .priority import get_priority
 from .utils import (
@@ -34,7 +34,6 @@ from .utils import (
 
 def example_to_device(example, device, non_blocking=False) -> dict:
     example_torch = {}
-    float_names = ["voxels", "bev_map"]
     for k, v in example.items():
         if k in ["anchors", "anchors_mask", "reg_targets", "reg_weights", "labels", "hm",
                  "anno_box", "ind", "mask", 'cat']:
@@ -51,25 +50,13 @@ def example_to_device(example, device, non_blocking=False) -> dict:
             "cyv_num_voxels",
             "cyv_coordinates",
             "cyv_num_points",
-            "gt_boxes_cls",
-            "yolo_map1",
-            "yolo_map2",
-            "yolo_map3",
-            "target_boxes_grid1",
-            "target_boxes_grid2",
-            "target_boxes_grid3",
-            "classifier_map1",
-            "classifier_map2",
-            "classifier_map3",
-            "grid_map1",
-            "grid_map2",
-            "grid_map3",
-            "grid_map4"
+            "gt_boxes",
+            "yolo_map1", "yolo_map2", "yolo_map3",
+            "classifier_map1", "classifier_map2", "classifier_map3",
         ]:
             example_torch[k] = v.to(device, non_blocking=non_blocking, dtype=torch.float)
+
         elif k in [
-            "obj_mask",
-            "noobj_mask",
             "obj_mask1",
             "obj_mask2",
             "obj_mask3",
@@ -98,57 +85,6 @@ def parse_losses(losses):
     return loss, log_vars
 
 
-class BackgroundGenerator(threading.Thread):
-    def __init__(self, generator, max_prefetch=1):
-        threading.Thread.__init__(self)
-        self.queue = queue.Queue(max_prefetch)
-        self.generator = generator
-        self.daemon = True
-        self.start()
-
-    def run(self):
-        for item in self.generator:
-            self.queue.put(item)
-        self.queue.put(None)
-
-    def next(self):
-        next_item = self.queue.get()
-        if next_item is None:
-            raise StopIteration
-        return next_item
-
-    # Python 3 compatibility
-    def __next__(self):
-        return self.next()
-
-    def __iter__(self):
-        return self
-
-
-class Prefetcher(object):
-    def __init__(self, dataloader):
-        self.loader = iter(dataloader)
-        self.stream = torch.cuda.Stream()
-        self.preload()
-
-    def preload(self):
-        try:
-            self.next_input = next(self.loader)
-        except StopIteration:
-            self.next_input = None
-            return
-        with torch.cuda.stream(self.stream):
-            self.next_input = example_to_device(
-                self.next_input, torch.cuda.current_device(), non_blocking=False
-            )
-
-    def next(self):
-        torch.cuda.current_stream().wait_stream(self.stream)
-        input = self.next_input
-        self.preload()
-        return input
-
-
 class Trainer(object):
     """ A training helper for PyTorch
 
@@ -164,7 +100,6 @@ class Trainer(object):
     def __init__(
             self,
             model,
-            batch_processor,
             optimizer=None,
             lr_scheduler=None,
             img_dim=416,
@@ -174,7 +109,6 @@ class Trainer(object):
             logger=None,
             **kwargs,
     ):
-        assert callable(batch_processor)
 
         self.model = model
         self.optimizer = optimizer
@@ -183,9 +117,6 @@ class Trainer(object):
         self.iou_thres = iou_thres
 
         self.lr = []
-        self.loss = []
-
-        self.batch_processor = batch_processor
 
         # Create work_dir
         if torchie.is_str(work_dir):
@@ -381,13 +312,6 @@ class Trainer(object):
         # torchie.symlink(filename, linkpath)
 
     def batch_processor_inline(self, model, data, train_mode, **kwargs):
-
-        if "local_rank" in kwargs:
-            device = torch.device(kwargs["local_rank"])
-        else:
-            device = None
-
-        # data = example_convert_to_torch(data, device=device)
         example = example_to_device(
             data, torch.cuda.current_device(), non_blocking=True
         )
@@ -450,66 +374,37 @@ class Trainer(object):
         self.data_loader = data_loader
         self.call_hook("before_val_epoch")
 
-        if self.rank == 0:
-            prog_bar = torchie.ProgressBar(len(data_loader.dataset))
-
-        detections = {}
-        cpu_device = torch.device("cpu")
-
+        labels = []
+        sample_metrics = []  # List of tuples (TP, confs, pred)
         for i, data_batch in enumerate(data_loader):
             self._inner_iter = i
             self.call_hook("before_val_iter")
+
+            targets = data_batch['gt_boxes']
+            labels += targets[:, 1].tolist()
+            targets[:, 1:] = xywh2xyxy(targets[:, 1:])
+            targets[:, 1:] *= self.img_dim
+
             with torch.no_grad():
-                outputs = self.batch_processor(
+                outputs = self.batch_processor_inline(
                     self.model, data_batch, train_mode=False, **kwargs
                 )
-            for output in outputs:
-                token = output["metadata"]["token"]
-                for k, v in output.items():
-                    if k not in [
-                        "metadata",
-                    ]:
-                        if v is not None:
-                            output[k] = v.to(cpu_device)
-                        else:
-                            output[k] = None
-                detections.update(
-                    {token: output,}
-                )
-                if self.rank == 0:
-                    for _ in range(self.world_size):
-                        prog_bar.update()
 
-        synchronize()
+            sample_metric, _ = get_batch_statistics(outputs, targets, iou_threshold=self.iou_thres)
+            sample_metrics += sample_metric
 
-        all_predictions = all_gather(detections)
+        true_positives, pred_scores = [np.concatenate(x, 0) for x in list(zip(*sample_metrics))]
+        _, _, precision, recall, AP, f1 = compute_ap(true_positives, pred_scores, labels)
 
-        if self.rank != 0:
-            return
+        result_dict = {
+            "AP": AP * 100,
+            "F1 Score": f1 * 100,
+            "Recall": recall * 100,
+            "Precision": precision * 100,
+        }
 
-        predictions = {}
-        for p in all_predictions:
-            predictions.update(p)
-
-        result_dict_val = self.data_loader.dataset.evaluation(
-            predictions,
-            iou_thres=self.iou_thres,
-            img_dim=self.img_dim, #TODO change this to self.img_dim
-            output_dir=self.work_dir,
-            val_mode=True
-        )
-
-        self.log_buffer.update(result_dict_val)
+        self.log_buffer.update(result_dict)
         self.call_hook("after_val_epoch")
-
-    def range_test(self):
-        plt.figure(1)
-        plt.semilogx(self.lr, self.loss)
-        plt.grid(True, which="both")
-        plt.title('Range Test')
-        plt.xlabel('learning rate')
-        plt.ylabel('train loss')
-        plt.show()
 
     def resume(self, checkpoint, resume_optimizer=True, map_location="default"):
         if map_location == "default":
@@ -521,8 +416,8 @@ class Trainer(object):
 
         self._epoch = checkpoint["meta"]["epoch"]
         self._iter = checkpoint["meta"]["iter"]
-        self.lr_scheduler.last_step = self.iter # for cosine warmup
-        # self.lr_scheduler.last_epoch = self.iter  # for one cycle
+        # self.lr_scheduler.last_step = self.iter  # for cosine warmup
+        self.lr_scheduler.last_epoch = self.iter  # for one cycle
         if "optimizer" in checkpoint and resume_optimizer:
             self.optimizer.load_state_dict(checkpoint["optimizer"])
 

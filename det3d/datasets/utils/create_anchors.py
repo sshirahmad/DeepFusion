@@ -91,7 +91,7 @@ def generate_anchors(db_infos, num_anchors, img_size, class_name="pedestrian"):
     # run k_mean to find the anchors
     annotation_dims = np.ndarray(shape=(1, 2))
     for info in db_infos:
-        filename = info['cam_front_path']
+        filename = info['image_path']
         image = cv2.imread(filename)
         height, width, depth = image.shape
 

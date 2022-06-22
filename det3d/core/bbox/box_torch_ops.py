@@ -299,3 +299,33 @@ def box_iou(box1, box2):
     # inter(N,M) = (rb(N,M,2) - lt(N,M,2)).clamp(0).prod(2)
     inter = (torch.min(box1[:, None, 2:], box2[:, 2:]) - torch.max(box1[:, None, :2], box2[:, :2])).clamp(0).prod(2)
     return inter / (area1[:, None] + area2 - inter)  # iou = inter / (area1 + area2 - inter)
+
+
+def overlap_jit(boxes, query_boxes):
+    """calculate box iou. note that jit version runs 2x faster than cython in
+    my machine!
+    Parameters
+    ----------
+    boxes: (N, 4) ndarray of float
+    query_boxes: (K, 4) ndarray of float
+    Returns
+    -------
+    overlaps: (N, K) ndarray of overlap between boxes and query_boxes
+    """
+    N = boxes.size(0)
+    K = query_boxes.size(0)
+    overlaps = torch.zeros((N, K), dtype=boxes.dtype)
+    for k in range(K):
+        for n in range(N):
+            iw = (
+                min(boxes[n, 2], query_boxes[k, 2])
+                - max(boxes[n, 0], query_boxes[k, 0])
+            )
+            if iw > 0:
+                ih = (
+                    min(boxes[n, 3], query_boxes[k, 3])
+                    - max(boxes[n, 1], query_boxes[k, 1])
+                )
+                if ih > 0:
+                    overlaps[n, k] = iw * ih
+    return overlaps

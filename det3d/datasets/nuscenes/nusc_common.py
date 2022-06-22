@@ -194,39 +194,13 @@ def _cam_nusc_box_to_global(nusc, boxes, sample_token):
     return box_list
 
 
-def _get_available_scenes(nusc):
-    available_scenes = []
-    print("total scene num:", len(nusc.scene))
-    for scene in nusc.scene:
-        scene_token = scene["token"]
-        scene_rec = nusc.get('scene', scene_token)
-        sample_rec = nusc.get('sample', scene_rec['first_sample_token'])
-        sd_radar_front_rec = nusc.get('sample_data', sample_rec['data']["RADAR_FRONT"])
-        sd_radar_left_rec = nusc.get('sample_data', sample_rec['data']["RADAR_FRONT_LEFT"])
-        sd_radar_right_rec = nusc.get('sample_data', sample_rec['data']["RADAR_FRONT_RIGHT"])
-        sd_cam_rec = nusc.get('sample_data', sample_rec['data']["CAM_FRONT"])
-        has_more_frames = True
-        scene_not_exist = False
+def _is_image_available(nusc, sample_rec):
 
-        # check if radar pcd and images are available in all scenes
-        while has_more_frames:
-            radar_front_path, _, _ = nusc.get_sample_data(sd_radar_front_rec['token'])
-            cam_path, _, _ = nusc.get_sample_data(sd_cam_rec['token'])
+    sd_cam_rec = nusc.get('sample_data', sample_rec['data']["CAM_FRONT"])
+    cam_path, _, _ = nusc.get_sample_data(sd_cam_rec['token'])
+    exists = Path(cam_path).exists()
 
-            if not Path(radar_front_path).exists() or not Path(cam_path).exists():
-                scene_not_exist = True
-                break
-            else:
-                if not sd_radar_front_rec['next'] == "" and not sd_cam_rec['next'] == "":
-                    sd_radar_front_rec = nusc.get('sample_data', sd_radar_front_rec['next'])
-                    sd_cam_rec = nusc.get('sample_data', sd_cam_rec['next'])
-                else:
-                    has_more_frames = False
-        if scene_not_exist:
-            continue
-        available_scenes.append(scene)
-    print("exist scene num:", len(available_scenes))
-    return available_scenes
+    return exists
 
 
 def get_sample_data(nusc, sample_data_token: str,
@@ -307,6 +281,9 @@ def _fill_trainval_infos(nusc, train_scenes, val_scenes, test=False, nsweeps=10,
         if sample["scene_token"] not in train_scenes and sample["scene_token"] not in val_scenes:
             continue
 
+        if not _is_image_available(nusc, sample):
+            continue
+
         # boxes are in camera's coordinate
         # BoxVisibility.ALL Requires all corners are inside the image.
         # BoxVisibility.ANY Requires at least one corner visible in the image.
@@ -317,7 +294,7 @@ def _fill_trainval_infos(nusc, train_scenes, val_scenes, test=False, nsweeps=10,
         )
 
         info = {
-            "cam_front_path": ref_cam_path,
+            "image_path": ref_cam_path,
             "cam_intrinsic": ref_cam_intrinsic,
             "token": sample["token"],
             "sweeps": [],
@@ -327,6 +304,7 @@ def _fill_trainval_infos(nusc, train_scenes, val_scenes, test=False, nsweeps=10,
         all_radar_pcs = RadarPointCloud(np.zeros((18, 0)))
         all_sweep_times = np.zeros((1, 0))
         for radar_channel in channels:
+            # some radar channels data might not exist in the scene
             try:
                 radar_pcs, sweep_times = RadarPointCloud.from_file_multisweep(nusc=nusc,
                                                                               sample_rec=sample,
@@ -335,7 +313,7 @@ def _fill_trainval_infos(nusc, train_scenes, val_scenes, test=False, nsweeps=10,
                                                                               nsweeps=nsweeps)
                 all_radar_pcs.points = np.hstack((all_radar_pcs.points, radar_pcs.points))
                 all_sweep_times = np.hstack((all_sweep_times, sweep_times))
-            except:
+            except FileNotFoundError:
                 continue
 
         info["sweeps"] = all_radar_pcs.points.T
@@ -432,7 +410,7 @@ def create_nuscenes_infos(root_path, version="v1.0-trainval", nsweeps=10, filter
     test = "test" in version
     root_path = Path(root_path)
     # filter exist scenes. you may only download part of dataset.
-    available_scenes = _get_available_scenes(nusc)
+    available_scenes = nusc.scene
     available_scene_names = [s["name"] for s in available_scenes]
     train_scenes = list(filter(lambda x: x in available_scene_names, train_scenes))
     val_scenes = list(filter(lambda x: x in available_scene_names, val_scenes))

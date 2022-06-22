@@ -16,7 +16,6 @@ class SingleStageDetector(BaseDetector):
         reader=None,
         neck=None,
         bbox_head=None,
-        train_cfg=None,
         test_cfg=None,
         pretrained=None,
     ):
@@ -30,7 +29,6 @@ class SingleStageDetector(BaseDetector):
         if neck is not None:
             self.neck = builder.build_neck(neck)
         self.bbox_head = builder.build_head(bbox_head)
-        self.train_cfg = train_cfg
         self.test_cfg = test_cfg
 
         self.init_weights(pretrained=pretrained)

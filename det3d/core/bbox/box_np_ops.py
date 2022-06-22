@@ -837,7 +837,7 @@ def change_box3d_center_(box3d, src, dst):
 
 
 def bbox_wh_iou(wh1, wh2):
-    w1, h1 = wh1[0], wh1[1]
+    w1, h1 = wh1[2] - wh1[0], wh1[3] - wh1[1]
     w2, h2 = wh2[:, 0], wh2[:, 1]
     inter_area = np.minimum(w1, w2) * np.minimum(h1, h2)
     union_area = w1 * h1 + w2 * h2 - inter_area

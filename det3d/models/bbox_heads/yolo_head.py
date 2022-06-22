@@ -12,7 +12,7 @@ from det3d.core import box_torch_ops, box_np_ops
 import matplotlib.pyplot as plt
 import numpy as np
 from ..registry import HEADS
-from det3d.models.losses.yolo_loss import BBoxRegLoss, GridRegLoss, CrossEntropyLoss
+from det3d.models.losses.yolo_loss import IoULoss, GridRegLoss, CrossEntropyLoss
 from ..utils import build_norm_layer
 
 

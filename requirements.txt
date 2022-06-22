@@ -3,6 +3,8 @@ matplotlib
 fire        
 future
 tensorboard
+tensorflow
+tensorflow-gpu
 imgaug                                                                                              
 protobuf                                                                                                  
 opencv-python                                                                                             
