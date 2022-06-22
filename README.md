@@ -33,6 +33,7 @@ better used for pedestrian detection.
 - **Extensible**: The backbone, head, and other parts of the network can be easily replaced.
 
 ## Main results
+These results are unofficial. The results were improved after acceptance of the paper.
 
 #### Detection on INRIA test set 
 
