@@ -1,6 +1,6 @@
 # Real-Time Pedestrian Detection Using Enhanced Representations from Light-Weight YOLO Network
 
-DeepFusion is a pedestrian detection model which uses RGB images and radar point clouds. The major contribution in this work was to decrease the processing time while maintaining accuracy. For this purpose, we significantly reduced the dimensions of input images and modified the main YOLOv3 network to compensate the reduction of accuracy due to reduced resolution.    
+DeepFusion is a pedestrian detection model which uses RGB images and radar point clouds. The major contribution in this work was to decrease the processing time while maintaining accuracy. For this purpose, we significantly reduced the dimensions of input images and modified the main YOLOv3 network to compensate the reduction of accuracy due to reduced resolution. This work is accepted and presented at the 8th International Conference on Control, Decision and Information Technologies (CoDIT 2022)  and will be published in IEEE Xplore. 
 
 <p align="center"> <img src='./docs/enhanced_yolov3.png' align="center" > </p>
 
@@ -52,7 +52,7 @@ Results are tested on a NVIDIA GeForce RTX 3060 GPU with batch size 1.
 
 ### Installation
 
-Please install the packages listed in requirements.txt document and torch from https://pytorch.org/.
+This work is implemented in PyTorch and Tensorflow. The Tensorflow version only supports INRIA dataset. Please install the packages listed in requirements.txt document and torch from https://pytorch.org/.
 
 ### Benchmark Evaluation and Training 
 
