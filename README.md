@@ -56,7 +56,7 @@ This work is implemented in PyTorch and Tensorflow. The Tensorflow version only 
 
 ### Benchmark Evaluation and Training 
 
-All detection, dataset, post-processing, training, test, and model are included in [configs](configs). To create the bounding groundtruth and input information of each dataset, run create_data.py. To train the network, run train.py. To evaluate the model and visualization of results run test.py.
+All detection, dataset, post-processing, training, test, and model are included in [configs](./PyTorch_codes/configs). To create the bounding groundtruth and input information of each dataset, run create_data.py. To train the network, run train.py. To evaluate the model and visualization of results run test.py.
 
 ### ToDo List
 - [ ] Test it on Caltech dataset
