@@ -1,4 +1,4 @@
-# [Real-Time Pedestrian Detection Using Enhanced Representations from Light-Weight YOLO Network](https://ieeexplore.ieee.org/abstract/document/9804060)
+# [Real-Time Pedestrian Detection Using Enhanced Representations from Light-Weight YOLO Network (Paper)](https://ieeexplore.ieee.org/abstract/document/9804060)
 
 DeepFusion is a pedestrian detection model which uses RGB images and radar point clouds. The major contribution in this work was to decrease the processing time while maintaining accuracy. For this purpose, we significantly reduced the dimensions of input images and modified the main YOLOv3 network to compensate the reduction of accuracy due to reduced resolution. This work is accepted and presented at the 8th International Conference on Control, Decision and Information Technologies (CoDIT 2022)  and will be published in IEEE Xplore. 
 
